@@ -15,6 +15,8 @@ from astrbot.core.star.register.star_handler import (
 )
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
+from astrbot.core.agent.message import TextPart
+
 from .gif_processor import GifProcessor
 
 
@@ -187,6 +189,8 @@ class ReadGifPlugin(Star):
 
         if modified:
             event.message_obj.message = new_message
+            # 标记本次请求处理过 GIF，供 on_llm_request 注入提示词
+            event.set_extra("gif_processed", True)
 
     @register_on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
@@ -196,40 +200,57 @@ class ReadGifPlugin(Star):
         build_main_agent 处理的是宫格图，req.image_urls 中不会出现 GIF。
         但某些路径（如 ThirdPartyAgentSubStage）会直接从消息链提取 image_urls，
         这里作为最后兜底，扫描并替换任何漏网的 GIF。
+
+        同时，当检测到 GIF 被处理时，通过 extra_user_content_parts 注入提示词，
+        让 LLM 知道这是动图，但不暴露帧序列等技术细节。
         """
         if not self._get_config("enabled", True):
             return
 
-        if not req.image_urls:
-            return
+        gif_processed_count = 0
 
-        new_urls = []
-        for url in req.image_urls:
-            if not self.processor.is_gif(url):
-                new_urls.append(url)
-                continue
-            try:
-                grid_path, info = await self.processor.process_gif(
-                    url,
-                    grid_preset=self._get_config("grid_preset", "auto"),
-                    cache_dir=self._get_cache_dir(),
-                    max_output_size=self._get_config("max_output_size", 1536),
-                )
-                if grid_path and os.path.exists(grid_path):
-                    new_urls.append(grid_path)
-                    preset = self._get_config("grid_preset", "auto")
-                    logger.info(
-                        f"[astrbot_plugin_read_gif] GIF帧数{info['frame_count']}，"
-                        f"秒数{info['duration_s']:.2f}s，"
-                        f"已选[{preset}]，"
-                        f"{'智能转为' if preset == 'auto' else '转为'}{info['grid_size']}宫格"
-                    )
-                else:
+        if req.image_urls:
+            new_urls = []
+            for url in req.image_urls:
+                if not self.processor.is_gif(url):
                     new_urls.append(url)
-            except Exception as exc:
-                logger.warning(f"[astrbot_plugin_read_gif] GIF 处理失败(image_urls): {exc}")
-                new_urls.append(url)
-        req.image_urls = new_urls
+                    continue
+                try:
+                    grid_path, info = await self.processor.process_gif(
+                        url,
+                        grid_preset=self._get_config("grid_preset", "auto"),
+                        cache_dir=self._get_cache_dir(),
+                        max_output_size=self._get_config("max_output_size", 1536),
+                    )
+                    if grid_path and os.path.exists(grid_path):
+                        new_urls.append(grid_path)
+                        gif_processed_count += 1
+                        preset = self._get_config("grid_preset", "auto")
+                        logger.info(
+                            f"[astrbot_plugin_read_gif] GIF帧数{info['frame_count']}，"
+                            f"秒数{info['duration_s']:.2f}s，"
+                            f"已选[{preset}]，"
+                            f"{'智能转为' if preset == 'auto' else '转为'}{info['grid_size']}宫格"
+                        )
+                    else:
+                        new_urls.append(url)
+                except Exception as exc:
+                    logger.warning(f"[astrbot_plugin_read_gif] GIF 处理失败(image_urls): {exc}")
+                    new_urls.append(url)
+            req.image_urls = new_urls
+
+        # 检查 on_waiting_llm_request 是否标记了 GIF 处理
+        gif_flag = event.get_extra("gif_processed", False)
+
+        if gif_processed_count > 0 or gif_flag:
+            # 注入提示词，让 LLM 知道这是 GIF 动图
+            # 默认值由 _conf_schema.json 提供；留空则不注入
+            hint_text = self._get_config("gif_hint_text", "")
+            if hint_text:
+                hint_part = TextPart(text=hint_text)
+                hint_part.mark_as_temp()
+                req.extra_user_content_parts.append(hint_part)
+                logger.debug("[astrbot_plugin_read_gif] 已注入 GIF 提示词到 extra_user_content_parts")
 
     @register_command("gifcache")
     async def gif_cache_cmd(self, event: AstrMessageEvent) -> None:
