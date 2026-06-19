@@ -1,10 +1,4 @@
 {
-  "enabled": {
-    "type": "bool",
-    "description": "启用 GIF 宫格转换",
-    "hint": "关闭后插件将不做任何处理，GIF 保持原样传给 LLM",
-    "default": true
-  },
   "grid_preset": {
     "type": "string",
     "description": "宫格预设",
@@ -34,6 +28,12 @@
     "type": "text",
     "description": "GIF 动图提示词",
     "hint": "处理 GIF 后注入给 LLM 的提示词，引导模型理解宫格图代表一段动画。留空则不注入任何提示词。",
-    "default": "下方的图片中可能包含宫格图。宫格图是 GIF 动图的关键帧拆分，这些帧按时间顺序排列，共同描述了一段连续画面。请把它们当作动态 GIF 来理解，不要向用户提及“宫格”、“拼接”等技术细节。"
+    "default": "图片中可能包含宫格图。宫格图是 GIF 动图的关键帧拆分，这些帧按时间顺序排列，共同描述了一段连续画面。请把它们当作动态 GIF 来理解，禁止提及“宫格”、“拼接”等技术细节。"
+  },
+  "debug_to_info": {
+    "type": "bool",
+    "description": "在 Info 日志中显示 Debug 信息",
+    "hint": "默认关闭。开启后，本插件所有 Debug 级别的诊断日志会升级为 Info 级别输出，便于在不调整全局日志等级的情况下排查问题。",
+    "default": false
   }
 }
