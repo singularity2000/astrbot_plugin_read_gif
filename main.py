@@ -1,5 +1,7 @@
 import os
+import re
 import time
+import base64
 from pathlib import Path
 from typing import Any
 
@@ -15,8 +17,6 @@ from astrbot.core.star.register.star_handler import (
 )
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
-from astrbot.core.agent.message import TextPart
-
 from .gif_processor import GifProcessor
 
 
@@ -28,7 +28,17 @@ class ReadGifPlugin(Star):
     将其均匀取帧拼成宫格静态图，替换 Image 组件。
     由于此阶段早于 build_main_agent，后续流程会把宫格图当成普通图片处理，
     自然进入 req.image_urls，不会被 AstrBot 的图片压缩破坏成单帧 JPEG。
+
+    GIF 提示词注入策略（on_llm_request 阶段）：
+    - 注入位置：req.system_prompt（独立 system message，与用户文本分离）
+    - 用标记对 GIF_HINT_MARK 把提示词包起来，注入前先清理旧痕迹
+    - 虽然 system_prompt 每轮由 build_main_agent 重建，标记清理是防御性措施，
+      防止同一轮内 on_llm_request 被多次触发或框架行为变化导致累积
     """
+
+    # 提示词标记对：用于在 system_prompt 中精准定位并清理旧提示词
+    _GIF_HINT_START = "[GIF_HINT_START]"
+    _GIF_HINT_END = "[GIF_HINT_END]"
 
     def __init__(self, context: Context, config: dict) -> None:
         super().__init__(context)
@@ -117,7 +127,7 @@ class ReadGifPlugin(Star):
                 image_path,
                 grid_preset=self._get_config("grid_preset", "auto"),
                 cache_dir=self._get_cache_dir(),
-                max_output_size=self._get_config("max_output_size", 1536),
+                max_output_size=self._get_config("max_output_size", 1600),
             )
         except Exception as exc:
             logger.warning(f"[astrbot_plugin_read_gif] GIF 处理失败: {exc}")
@@ -194,63 +204,89 @@ class ReadGifPlugin(Star):
 
     @register_on_llm_request()
     async def on_llm_request(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
-        """兜底：处理经过第三方 Agent Runner 或其他路径进入 req.image_urls 的 GIF。
+        """提示词注入 + 第三方 Agent Runner 路径检测。
 
         正常情况下，on_waiting_llm_request 已经把 GIF 替换成了宫格图，
         build_main_agent 处理的是宫格图，req.image_urls 中不会出现 GIF。
-        但某些路径（如 ThirdPartyAgentSubStage）会直接从消息链提取 image_urls，
-        这里作为最后兜底，扫描并替换任何漏网的 GIF。
 
-        同时，当检测到 GIF 被处理时，通过 extra_user_content_parts 注入提示词，
-        让 LLM 知道这是动图，但不暴露帧序列等技术细节。
+        第三方 Agent Runner（Dify/Coze/Dashscope/DeerFlow）路径不触发
+        OnWaitingLLMRequestEvent，GIF 会以 base64 原文进入 req.image_urls，
+        本插件无法有效替换（外部平台通常只取第一帧）。此处检测到该情况时
+        打一条 info 日志提示用户，不静默失效。
+
+        当检测到 GIF 被处理（on_waiting_llm_request 标记）时，通过
+        system_prompt 注入提示词，让 LLM 知道这是动图，但不暴露帧序列等
+        技术细节。提示词注入到 system_prompt（独立 system message），与
+        用户文本完全分离；用标记对包裹，注入前先清理旧痕迹。
         """
         if not self._get_config("enabled", True):
             return
 
-        gif_processed_count = 0
-
-        if req.image_urls:
-            new_urls = []
-            for url in req.image_urls:
-                if not self.processor.is_gif(url):
-                    new_urls.append(url)
-                    continue
-                try:
-                    grid_path, info = await self.processor.process_gif(
-                        url,
-                        grid_preset=self._get_config("grid_preset", "auto"),
-                        cache_dir=self._get_cache_dir(),
-                        max_output_size=self._get_config("max_output_size", 1536),
-                    )
-                    if grid_path and os.path.exists(grid_path):
-                        new_urls.append(grid_path)
-                        gif_processed_count += 1
-                        preset = self._get_config("grid_preset", "auto")
-                        logger.info(
-                            f"[astrbot_plugin_read_gif] GIF帧数{info['frame_count']}，"
-                            f"秒数{info['duration_s']:.2f}s，"
-                            f"已选[{preset}]，"
-                            f"{'智能转为' if preset == 'auto' else '转为'}{info['grid_size']}宫格"
-                        )
-                    else:
-                        new_urls.append(url)
-                except Exception as exc:
-                    logger.warning(f"[astrbot_plugin_read_gif] GIF 处理失败(image_urls): {exc}")
-                    new_urls.append(url)
-            req.image_urls = new_urls
+        # 检测第三方 Agent Runner 路径：req.image_urls 中出现 base64 GIF
+        third_party_gif_count = self._count_base64_gif_in_urls(req.image_urls)
+        if third_party_gif_count > 0:
+            logger.info(
+                "[astrbot_plugin_read_gif] 检测到第三方 Agent Runner 路径下传入了 "
+                f"{third_party_gif_count} 张 GIF，本插件仅对内置 Agent 生效，"
+                "GIF 替换将不生效（外部平台通常只取第一帧）。"
+            )
 
         # 检查 on_waiting_llm_request 是否标记了 GIF 处理
         gif_flag = event.get_extra("gif_processed", False)
 
-        if gif_processed_count > 0 or gif_flag:
-            # 注入提示词，让 LLM 知道这是 GIF 动图
+        if gif_flag:
+            # 注入提示词到 system_prompt（独立 system message，与用户文本分离）
             # 默认值由 _conf_schema.json 提供；留空则不注入
             hint_text = self._get_config("gif_hint_text", "")
             if hint_text:
-                hint_part = TextPart(text=hint_text)
-                hint_part.mark_as_temp()
-                req.extra_user_content_parts.append(hint_part)
-                logger.debug("[astrbot_plugin_read_gif] 已注入 GIF 提示词到 extra_user_content_parts")
+                # 防御性清理：移除可能存在的旧提示词标记段
+                # （system_prompt 每轮由 build_main_agent 重建，正常情况无残留；
+                #   此清理防止同轮多次触发或框架行为变化的边缘情况）
+                pattern = re.compile(
+                    re.escape(self._GIF_HINT_START)
+                    + r".*?"
+                    + re.escape(self._GIF_HINT_END)
+                    + r"\n*",
+                    re.DOTALL,
+                )
+                req.system_prompt = pattern.sub("", req.system_prompt or "")
+                # 追加新提示词，用标记对包裹
+                req.system_prompt = (
+                    f"{req.system_prompt or ''}\n"
+                    f"{self._GIF_HINT_START}\n{hint_text}\n{self._GIF_HINT_END}\n"
+                )
+                logger.debug("[astrbot_plugin_read_gif] 已注入 GIF 提示词到 system_prompt")
+
+    @staticmethod
+    def _count_base64_gif_in_urls(urls) -> int:
+        """统计 req.image_urls 中以 base64 编码的 GIF 数量。
+
+        第三方 Agent Runner 路径会把图片转为 base64 塞入 req.image_urls，
+        其中 GIF 的 base64 解码后前 6 字节为 GIF87a/GIF89a。
+        本地路径/url 路径不是第三方路径特征，跳过。
+        """
+        if not urls:
+            return 0
+        count = 0
+        for item in urls:
+            if not isinstance(item, str):
+                continue
+            raw = None
+            if item.startswith("data:image/gif;base64,"):
+                raw = item.split(",", 1)[1] if "," in item else ""
+            elif item.startswith("base64://"):
+                raw = item[len("base64://"):]
+            elif not item.startswith(("http", "file://", "/")) and not os.path.isfile(item):
+                # 纯 base64 字符串（第三方路径 convert_to_base64 的产出）
+                raw = item
+            if raw:
+                try:
+                    header = base64.b64decode(raw[:12])[:6]
+                    if header in (b"GIF87a", b"GIF89a"):
+                        count += 1
+                except Exception:
+                    pass
+        return count
 
     @register_command("gifcache")
     async def gif_cache_cmd(self, event: AstrMessageEvent) -> None:

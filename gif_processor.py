@@ -1,11 +1,13 @@
 """GIF 处理核心模块。
 
-提供 GIF 帧提取、宫格拼接、自动宫格数选择等功能。
+提供 GIF 帧提取、宫格拼接、自动宫格数选择、内容哈希去重等功能。
 依赖：Pillow
 """
 
 import os
 import math
+import asyncio
+import hashlib
 import uuid
 from typing import Tuple
 
@@ -16,25 +18,22 @@ class GifProcessor:
     """GIF 动图处理器。"""
 
     # 自动选择宫格的时长阈值（秒）和推荐宫格数
-    # 规则：时长越短，宫格越少，避免过度采样
+    # 规则：3秒内4宫格，10秒内9宫格，20秒内16宫格，超过20秒25宫格
     AUTO_GRID_RULES = [
-        (0.0, 4),    # 0~1.5s: 4宫格（极短动图）
-        (1.5, 4),    # 1.5~3s: 4宫格
-        (3.0, 9),    # 3~6s: 9宫格
-        (6.0, 9),    # 6~10s: 9宫格
-        (10.0, 16),  # 10~18s: 16宫格
-        (18.0, 16),  # 18~28s: 16宫格
-        (28.0, 25),  # 28s+: 25宫格
+        (0.0, 4),
+        (3.0, 9),
+        (10.0, 16),
+        (20.0, 25),
     ]
 
     # 默认最大输出尺寸限制（单张宫格图的长边像素）
-    DEFAULT_MAX_OUTPUT_SIZE = 1536
+    DEFAULT_MAX_OUTPUT_SIZE = 1600
 
     @staticmethod
     def is_gif(path: str) -> bool:
         """判断文件是否为 GIF 动图。
 
-        仅通过文件头 magic bytes 判断，不检查后缀。
+        仅通过文件头 magic bytes（GIF87a / GIF89a）判断，不检查后缀。
         这是因为平台适配器下载的临时文件可能使用无后缀或任意后缀的命名。
         """
         if not path or not os.path.isfile(path):
@@ -45,6 +44,21 @@ class GifProcessor:
                 return header in (b"GIF87a", b"GIF89a")
         except OSError:
             return False
+
+    @staticmethod
+    def compute_file_hash(path: str) -> str:
+        """计算文件内容的 SHA-256 哈希（前16位），用于缓存去重。
+
+        流式读取，避免大文件一次性载入内存。
+        """
+        h = hashlib.sha256()
+        with open(path, "rb") as f:
+            while True:
+                chunk = f.read(65536)
+                if not chunk:
+                    break
+                h.update(chunk)
+        return h.hexdigest()[:16]
 
     @classmethod
     def auto_grid_size(cls, duration_s: float, frame_count: int) -> int:
@@ -61,7 +75,7 @@ class GifProcessor:
             if duration_s >= threshold:
                 recommended = grid
 
-        # 不能超过实际帧数（至少留1帧余量）
+        # 不能超过实际帧数
         max_grid = max(1, frame_count)
         if recommended > max_grid:
             # 降级到最接近且不超过帧数的完全平方数
@@ -92,6 +106,11 @@ class GifProcessor:
         return grid
 
     @classmethod
+    def _cache_file_name(cls, file_hash: str, grid_size: int) -> str:
+        """生成缓存文件名：gif_grid_{hash}_{grid}.png"""
+        return f"gif_grid_{file_hash}_{grid_size}.png"
+
+    @classmethod
     async def process_gif(
         cls,
         gif_path: str,
@@ -105,23 +124,78 @@ class GifProcessor:
             gif_path: GIF 文件本地路径
             grid_preset: 宫格预设（4/9/16/25/auto/自动）
             cache_dir: 缓存目录
-            max_output_size: 宫格图长边最大像素，0 表示使用默认值 1536
+            max_output_size: 宫格图长边最大像素，0 表示使用默认值 1600
 
         Returns:
             (output_path, info_dict)
         """
+        # 确定缓存目录
+        if not cache_dir:
+            cache_dir = os.path.join(
+                os.path.expanduser("~"), ".cache", "astrbot_plugin_read_gif"
+            )
+
+        max_total = (
+            max_output_size if max_output_size > 0 else cls.DEFAULT_MAX_OUTPUT_SIZE
+        )
+
+        # 先在同步线程里完成 GIF 解析（帧数、时长、宫格数、哈希）
+        # 哈希与解析都涉及阻塞 IO/CPU，丢到线程池
+        parsed = await asyncio.to_thread(
+            cls._parse_gif_meta, gif_path, grid_preset, cache_dir, max_total
+        )
+
+        # 命中缓存则直接返回
+        cache_path = parsed["cache_path"]
+        if os.path.exists(cache_path):
+            info = {
+                "frame_count": parsed["frame_count"],
+                "duration_s": parsed["duration_s"],
+                "grid_size": parsed["grid_size"],
+                "grid_side": parsed["grid_side"],
+                "output_size": parsed["expected_size"],
+                "output_path": cache_path,
+            }
+            return cache_path, info
+
+        # 未命中缓存，在线程池里做完整处理（帧提取+拼接+保存）
+        output_path, output_size = await asyncio.to_thread(
+            cls._render_grid,
+            gif_path,
+            parsed,
+            cache_path,
+            max_total,
+        )
+
+        info = {
+            "frame_count": parsed["frame_count"],
+            "duration_s": parsed["duration_s"],
+            "grid_size": parsed["grid_size"],
+            "grid_side": parsed["grid_side"],
+            "output_size": output_size,
+            "output_path": output_path,
+        }
+        return output_path, info
+
+    @classmethod
+    def _parse_gif_meta(
+        cls,
+        gif_path: str,
+        grid_preset: str,
+        cache_dir: str,
+        max_total: int,
+    ) -> dict:
+        """同步：解析 GIF 元数据（帧数、时长、宫格数），计算缓存路径和预期输出尺寸。"""
         with PILImage.open(gif_path) as im:
             n_frames = getattr(im, "n_frames", 1)
 
             # 获取每帧延迟，计算总时长
             total_duration_ms = 0
-            frame_delays = []
             for i in range(n_frames):
                 im.seek(i)
                 delay = im.info.get("duration", 100)
                 if delay is None or delay <= 0:
                     delay = 100
-                frame_delays.append(delay)
                 total_duration_ms += delay
 
             duration_s = total_duration_ms / 1000.0
@@ -130,20 +204,63 @@ class GifProcessor:
             grid_size = cls.parse_grid_preset(grid_preset, duration_s, n_frames)
             grid_side = int(math.isqrt(grid_size))
 
-            # 均匀取帧索引
-            if n_frames <= grid_size:
-                indices = list(range(n_frames))
-                # 如果帧数不足，用最后一帧填充
-                while len(indices) < grid_size:
-                    indices.append(n_frames - 1)
-            else:
-                indices = [
-                    int(i * (n_frames - 1) / (grid_size - 1))
-                    for i in range(grid_size)
-                ]
+            # 取第一帧尺寸用于计算预期输出
+            im.seek(0)
+            first_w, first_h = im.size
 
-            # 提取帧并转为 RGB
-            frames = []
+        # 计算预期输出尺寸（含等比缩放）
+        total_w = first_w * grid_side
+        total_h = first_h * grid_side
+        scale = 1.0
+        if total_w > max_total or total_h > max_total:
+            scale = min(max_total / total_w, max_total / max(total_h, 1))
+        new_w = max(1, int(first_w * scale))
+        new_h = max(1, int(first_h * scale))
+        expected_size = (new_w * grid_side, new_h * grid_side)
+
+        # 计算内容哈希与缓存路径
+        file_hash = cls.compute_file_hash(gif_path)
+        os.makedirs(cache_dir, exist_ok=True)
+        cache_path = os.path.join(cache_dir, cls._cache_file_name(file_hash, grid_size))
+
+        return {
+            "frame_count": n_frames,
+            "duration_s": duration_s,
+            "grid_size": grid_size,
+            "grid_side": grid_side,
+            "expected_size": expected_size,
+            "cache_path": cache_path,
+            "scale": scale,
+        }
+
+    @classmethod
+    def _render_grid(
+        cls,
+        gif_path: str,
+        parsed: dict,
+        cache_path: str,
+        max_total: int,
+    ) -> Tuple[str, tuple]:
+        """同步：提取帧、拼接宫格、保存到缓存。返回 (输出路径, 输出尺寸)。"""
+        grid_size = parsed["grid_size"]
+        grid_side = parsed["grid_side"]
+        scale = parsed["scale"]
+        n_frames = parsed["frame_count"]
+
+        # 均匀取帧索引
+        if n_frames <= grid_size:
+            indices = list(range(n_frames))
+            # 帧数不足，用最后一帧填充
+            while len(indices) < grid_size:
+                indices.append(n_frames - 1)
+        else:
+            indices = [
+                int(i * (n_frames - 1) / (grid_size - 1)) for i in range(grid_size)
+            ]
+
+        # 提取帧并转为 RGB
+        frames = []
+        with PILImage.open(gif_path) as im:
             for idx in indices:
                 im.seek(idx)
                 frame = im.copy()
@@ -160,46 +277,24 @@ class GifProcessor:
         if not frames:
             raise ValueError("未能提取到任何帧")
 
-        # 计算单帧缩放比例，使最终宫格图长边不超过限制
+        # 单帧缩放
         single_w, single_h = frames[0].size
-        total_w = single_w * grid_side
-        total_h = single_h * grid_side
-        max_total = max_output_size if max_output_size > 0 else cls.DEFAULT_MAX_OUTPUT_SIZE
-        scale = 1.0
-        if total_w > max_total or total_h > max_total:
-            scale = min(max_total / total_w, max_total / total_h)
-
         new_w = max(1, int(single_w * scale))
         new_h = max(1, int(single_h * scale))
 
         if scale < 1.0:
             frames = [
-                f.resize((new_w, new_h), PILImage.Resampling.LANCZOS)
-                for f in frames
+                f.resize((new_w, new_h), PILImage.Resampling.LANCZOS) for f in frames
             ]
 
         # 拼接宫格
-        grid_img = PILImage.new("RGB", (new_w * grid_side, new_h * grid_side), (255, 255, 255))
+        grid_img = PILImage.new(
+            "RGB", (new_w * grid_side, new_h * grid_side), (255, 255, 255)
+        )
         for i, frame in enumerate(frames):
             x = (i % grid_side) * new_w
             y = (i // grid_side) * new_h
             grid_img.paste(frame, (x, y))
 
-        # 保存到缓存目录
-        if not cache_dir:
-            cache_dir = os.path.join(os.path.expanduser("~"), ".cache", "astrbot_plugin_read_gif")
-        os.makedirs(cache_dir, exist_ok=True)
-
-        out_name = f"gif_grid_{uuid.uuid4().hex[:12]}.png"
-        out_path = os.path.join(cache_dir, out_name)
-        grid_img.save(out_path, "PNG", optimize=True)
-
-        info = {
-            "frame_count": n_frames,
-            "duration_s": duration_s,
-            "grid_size": grid_size,
-            "grid_side": grid_side,
-            "output_size": grid_img.size,
-            "output_path": out_path,
-        }
-        return out_path, info
+        grid_img.save(cache_path, "PNG", optimize=True)
+        return cache_path, grid_img.size
