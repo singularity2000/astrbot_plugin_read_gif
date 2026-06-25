@@ -2,6 +2,7 @@ import os
 import re
 import time
 import base64
+import importlib
 from pathlib import Path
 from typing import Any
 
@@ -57,6 +58,12 @@ class ReadGifPlugin(Star):
     # 转述模型实例被本插件包装的标记属性名
     _WRAP_FLAG_ATTR = "_read_gif_text_chat_wrapped"
 
+    # 框架 PreProcessStage 模块路径（v4.26+ 在此对图片调用 ensure_jpeg）。
+    # 该阶段早于本插件任何钩子，会把 GIF 转成单帧 JPEG，使后续无从识别 GIF。
+    _PREPROCESS_MODULE = "astrbot.core.pipeline.preprocess_stage.stage"
+    # ensure_jpeg 已被本插件包装的标记属性名（幂等 + 卸载用）
+    _ENSURE_JPEG_FLAG = "_read_gif_ensure_jpeg_patched"
+
     def __init__(self, context: Context, config: dict) -> None:
         super().__init__(context)
         self.config = config
@@ -66,6 +73,80 @@ class ReadGifPlugin(Star):
         # 转述模型 text_chat 包装状态
         self._wrapped_provider = None        # 被包装的转述模型实例
         self._caption_hint_active = False    # 本轮包装是否生效（存活期内每次带图调用都追加）
+        # 中和框架 PreProcessStage 对 GIF 的 JPEG 转换（仅 v4.26+ 需要，旧版本自动跳过）
+        self._install_ensure_jpeg_guard()
+
+    def _install_ensure_jpeg_guard(self) -> None:
+        """中和框架 PreProcessStage 对 GIF 的 JPEG 转换。
+
+        背景：AstrBot v4.26+ 在 PreProcessStage（早于本插件任何钩子的管道阶段）
+        对消息链中每个 Image 调用 ensure_jpeg，把非 JPEG 图片（含 GIF）转成单帧
+        JPEG 并改写组件的 file/path/url。GIF 因此在抵达本插件的 on_waiting_llm_request
+        钩子前就被破坏成单帧，插件无从识别，表现为"完全静默失效"。
+
+        本方法在插件加载时，把 PreProcessStage 模块命名空间里的 ensure_jpeg 名字
+        替换为一个包装：遇到 GIF（magic bytes 判定，与 GifProcessor.is_gif 一致）
+        原样返回，跳过转换；非 GIF 完全透传原函数。GIF 由此原封不动抵达本插件钩子，
+        等价于把框架对 GIF 的行为退回到 v4.25.6。
+
+        安全性：
+        - 只替换 stage 模块的一个全局名（调用处 `await ensure_jpeg(...)` 在调用时
+          按该名查找），不修改框架任何源码文件，不触碰 media_utils 源定义。
+        - 旧版本（无该破坏逻辑）探测不到属性，直接跳过，不 patch。
+        - 幂等：已被本插件包装过则不重复包装（覆盖热重载）。
+        - 整体包 try/except：框架结构若再变动，最坏只是静默不 patch，绝不影响插件其余功能。
+        """
+        try:
+            mod = importlib.import_module(self._PREPROCESS_MODULE)
+        except Exception as exc:
+            # 模块不存在/结构变动：不影响插件其余功能
+            self._dlog(f"[astrbot_plugin_read_gif] 未能定位 PreProcessStage 模块，跳过 GIF 预处理中和: {exc}")
+            return
+
+        original = getattr(mod, "ensure_jpeg", None)
+        if original is None:
+            # 旧版本（如 v4.25.6）没有此破坏逻辑，GIF 本就正常，无需 patch
+            self._dlog("[astrbot_plugin_read_gif] 当前框架无 ensure_jpeg 预处理，无需中和")
+            return
+        if getattr(original, self._ENSURE_JPEG_FLAG, False):
+            # 已被本插件包装（热重载场景），保持幂等
+            return
+
+        async def _guarded_ensure_jpeg(*args, **kwargs):
+            # 安全取首个图片路径参数（兼容位置/关键字两种传法，且不假设后续参数）
+            image_path = args[0] if args else kwargs.get("image_path")
+            # 仅对 GIF 跳过：magic bytes 判定，与 GifProcessor.is_gif 完全一致
+            try:
+                if image_path and os.path.isfile(image_path):
+                    with open(image_path, "rb") as f:
+                        if f.read(6) in (b"GIF87a", b"GIF89a"):
+                            return image_path  # 原样返回，GIF 不被破坏
+            except OSError:
+                pass
+            # 非 GIF：原参数 100% 透传框架原始行为（签名变动也无损转发）
+            return await original(*args, **kwargs)
+
+        setattr(_guarded_ensure_jpeg, self._ENSURE_JPEG_FLAG, True)
+        # 留存原函数，供卸载时恢复
+        _guarded_ensure_jpeg._read_gif_original = original
+        mod.ensure_jpeg = _guarded_ensure_jpeg
+        logger.info(
+            "[astrbot_plugin_read_gif] 已中和框架 PreProcessStage 的 GIF→JPEG 预处理，"
+            "GIF 将原样抵达本插件处理"
+        )
+
+    def _uninstall_ensure_jpeg_guard(self) -> None:
+        """卸载 ensure_jpeg 包装，恢复框架原始函数。幂等，无副作用。"""
+        try:
+            mod = importlib.import_module(self._PREPROCESS_MODULE)
+        except Exception:
+            return
+        current = getattr(mod, "ensure_jpeg", None)
+        if current is not None and getattr(current, self._ENSURE_JPEG_FLAG, False):
+            original = getattr(current, "_read_gif_original", None)
+            if original is not None:
+                mod.ensure_jpeg = original
+                logger.info("[astrbot_plugin_read_gif] 已恢复框架原始 ensure_jpeg 预处理")
 
     def _ensure_cache_dir(self) -> None:
         """确保缓存目录存在。"""
@@ -538,12 +619,15 @@ class ReadGifPlugin(Star):
         yield event.plain_result(f"已清理 {removed} 个缓存文件。")
 
     async def terminate(self) -> None:
-        """插件禁用/重载时调用：兜底卸载可能残留的转述模型 text_chat 包装。
+        """插件禁用/重载时调用：兜底卸载本插件安装的所有运行时包装。
 
-        若插件在已安装包装的状态下被卸载或热重载，转述模型实例上会残留
-        被覆盖的 text_chat。此处卸载，恢复到原始类方法。
+        两类包装都需在此恢复，互不影响：
+        1) 转述模型实例的 text_chat 包装（若本轮残留）；
+        2) 框架 PreProcessStage 的 ensure_jpeg 包装（GIF 防破坏 guard）。
+        若插件在已安装包装的状态下被卸载或热重载，不恢复会留下残留覆盖。
         """
-        if self._wrapped_provider is None:
-            return
-        self._uninstall_caption_wrapper()
-        logger.info("[astrbot_plugin_read_gif] terminate 时已兜底卸载转述包装")
+        if self._wrapped_provider is not None:
+            self._uninstall_caption_wrapper()
+            logger.info("[astrbot_plugin_read_gif] terminate 时已兜底卸载转述包装")
+        # 恢复框架原始 ensure_jpeg，避免插件卸载后仍残留 GIF guard 包装
+        self._uninstall_ensure_jpeg_guard()

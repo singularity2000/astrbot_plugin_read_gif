@@ -1,7 +1,7 @@
 name: astrbot_plugin_read_gif
 display_name: GIF 动图 LLM 增强
 desc: 将发送给 LLM 的 GIF 动图自动转为宫格静态图，让多模态模型真正读懂动图内容，而非只看第一帧。
-version: "1.2.0"
+version: "1.2.1"
 author: Singularity
 repo: https://github.com/singularity2000/astrbot_plugin_read_gif
 astrbot_version: ">=4.0.0"
