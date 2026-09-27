@@ -8,7 +8,6 @@ import os
 import math
 import asyncio
 import hashlib
-import uuid
 from typing import Tuple
 
 from PIL import Image as PILImage
@@ -61,7 +60,7 @@ class GifProcessor:
         return h.hexdigest()[:16]
 
     @classmethod
-    def auto_grid_size(cls, duration_s: float, frame_count: int) -> int:
+    def auto_grid_size(cls, duration_s: float, frame_count: int, thresholds=None) -> int:
         """根据 GIF 时长和帧数智能选择宫格数。
 
         优先按时长选择，同时确保宫格数不超过帧数（避免重复帧）。
@@ -71,7 +70,8 @@ class GifProcessor:
 
         # 按时长找推荐值
         recommended = 4
-        for threshold, grid in cls.AUTO_GRID_RULES:
+        rules = cls.AUTO_GRID_RULES if thresholds is None else [(0.0, 4), *zip(thresholds, (9, 16, 25))]
+        for threshold, grid in rules:
             if duration_s >= threshold:
                 recommended = grid
 
@@ -85,7 +85,7 @@ class GifProcessor:
         return recommended
 
     @classmethod
-    def parse_grid_preset(cls, preset: str, duration_s: float, frame_count: int) -> int:
+    def parse_grid_preset(cls, preset: str, duration_s: float, frame_count: int, thresholds=None) -> int:
         """解析用户配置的宫格预设。"""
         preset = str(preset).strip().lower()
         mapping = {
@@ -102,7 +102,7 @@ class GifProcessor:
         }
         grid = mapping.get(preset, 0)
         if grid == 0:
-            grid = cls.auto_grid_size(duration_s, frame_count)
+            grid = cls.auto_grid_size(duration_s, frame_count, thresholds)
         return grid
 
     @classmethod
@@ -117,6 +117,7 @@ class GifProcessor:
         grid_preset: str = "auto",
         cache_dir: str = "",
         max_output_size: int = 0,
+        thresholds=None,
     ) -> Tuple[str, dict]:
         """处理 GIF 文件，返回宫格图路径和信息字典。
 
@@ -142,12 +143,19 @@ class GifProcessor:
         # 先在同步线程里完成 GIF 解析（帧数、时长、宫格数、哈希）
         # 哈希与解析都涉及阻塞 IO/CPU，丢到线程池
         parsed = await asyncio.to_thread(
-            cls._parse_gif_meta, gif_path, grid_preset, cache_dir, max_total
+            cls._parse_gif_meta, gif_path, grid_preset, cache_dir, max_total, thresholds
         )
 
         # 命中缓存则直接返回
         cache_path = parsed["cache_path"]
+        cache_valid = False
         if os.path.exists(cache_path):
+            try:
+                with PILImage.open(cache_path) as cached:
+                    cache_valid = cached.size == parsed["expected_size"]
+            except OSError:
+                pass
+        if cache_valid:
             info = {
                 "frame_count": parsed["frame_count"],
                 "duration_s": parsed["duration_s"],
@@ -184,6 +192,7 @@ class GifProcessor:
         grid_preset: str,
         cache_dir: str,
         max_total: int,
+        thresholds=None,
     ) -> dict:
         """同步：解析 GIF 元数据（帧数、时长、宫格数），计算缓存路径和预期输出尺寸。"""
         with PILImage.open(gif_path) as im:
@@ -201,7 +210,7 @@ class GifProcessor:
             duration_s = total_duration_ms / 1000.0
 
             # 确定宫格数
-            grid_size = cls.parse_grid_preset(grid_preset, duration_s, n_frames)
+            grid_size = cls.parse_grid_preset(grid_preset, duration_s, n_frames, thresholds)
             grid_side = int(math.isqrt(grid_size))
 
             # 取第一帧尺寸用于计算预期输出

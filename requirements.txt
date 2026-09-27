@@ -1,0 +1,2 @@
+Pillow>=11.2.1
+# 视频功能还需要运行环境 PATH 中已有 ffmpeg 和 ffprobe；插件不会自动下载。

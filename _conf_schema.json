@@ -2,15 +2,89 @@
   "grid_preset": {
     "type": "string",
     "description": "宫格预设",
-    "hint": "自动：根据 GIF 时长智能选择最合适的宫格数",
+    "hint": "GIF 与视频共用。自动模式按各自的时长切换点选择 4/9/16/25 格；固定档不使用自动阈值。",
     "default": "auto",
-    "options": ["auto", "4", "9", "16", "25"]
+    "options": [
+      "auto",
+      "4",
+      "9",
+      "16",
+      "25"
+    ]
+  },
+  "gif_auto_thresholds": {
+    "type": "object",
+    "description": "GIF 自动宫格阈值（秒）",
+    "hint": "仅自动档生效。三个值须为有限正数且严格递增；无效时该组全部回退默认值。达到切换点即升档。",
+    "items": {
+      "to_9": {
+        "type": "float",
+        "description": "GIF：切换至 9 格的时长",
+        "default": 1
+      },
+      "to_16": {
+        "type": "float",
+        "description": "GIF：切换至 16 格的时长",
+        "default": 10
+      },
+      "to_25": {
+        "type": "float",
+        "description": "GIF：切换至 25 格的时长",
+        "default": 20
+      }
+    }
+  },
+  "video_auto_thresholds": {
+    "type": "object",
+    "description": "视频 自动宫格阈值（秒）",
+    "hint": "仅自动档生效。三个值须为有限正数且严格递增；无效时该组全部回退默认值。达到切换点即升档。",
+    "items": {
+      "to_9": {
+        "type": "float",
+        "description": "视频：切换至 9 格的时长",
+        "default": 5
+      },
+      "to_16": {
+        "type": "float",
+        "description": "视频：切换至 16 格的时长",
+        "default": 15
+      },
+      "to_25": {
+        "type": "float",
+        "description": "视频：切换至 25 格的时长",
+        "default": 30
+      }
+    }
   },
   "max_output_size": {
     "type": "int",
     "description": "宫格图长边限制（像素）",
     "hint": "宫格输出图的最大长边分辨率，超出会自动等比缩放。越大越清晰，但消耗更多 token",
     "default": 1600
+  },
+  "gif_hint_text": {
+    "type": "text",
+    "description": "GIF 动图提示词",
+    "hint": "处理 GIF 后注入给 LLM 的提示词，引导模型理解宫格图代表一段动画。留空则不注入任何提示词。",
+    "default": "图片中可能包含宫格图。宫格图是 GIF 动图的关键帧拆分，这些帧按时间顺序排列，共同描述了一段连续画面。请把它们当作动态 GIF 来理解，禁止提及“宫格”、“拼接”等技术细节。"
+  },
+  "video_hint_text": {
+    "type": "text",
+    "description": "视频理解提示词",
+    "hint": "只在处理视频后注入给看图的模型。留空关闭自定义提示，不影响视频编号、时长和采样时间等事实说明。",
+    "default": "消息可能包含宫格图。每组同编号宫格图中的画面来自同一段视频，按从左到右、从上到下的时间顺序排列。若附有同编号音频，请综合画面、对白及环境声音回答。请把这些画面作为视频的采样内容来理解，禁止提及“宫格”、“拼接”等技术细节。"
+  },
+  "video_max_duration": {
+    "type": "string",
+    "description": "视频时长上限",
+    "hint": "单位：秒，支持小数。默认 60；留空不限制；0、负数、非有限数或格式错误按 60 秒处理。超限跳过整个视频，不截取前半段。",
+    "default": "60"
+  },
+  "understand_video_audio": {
+    "type": "bool",
+    "description": "理解视频中的音频",
+    "hint": "开启时，提取有声视频的音轨，通过框架音频接口交给支持音频输入的主模型。不额外调用语音转文字服务；无音轨或完全静音时不发送音频。声音输入可能增加模型费用。",
+    "default": true
   },
   "auto_cleanup_interval_min": {
     "type": "int",
@@ -23,12 +97,6 @@
     "description": "缓存文件最大保留时长（小时）",
     "hint": "超过此时长的缓存文件会在自动清理时被删除",
     "default": 24
-  },
-  "gif_hint_text": {
-    "type": "text",
-    "description": "GIF 动图提示词",
-    "hint": "处理 GIF 后注入给 LLM 的提示词，引导模型理解宫格图代表一段动画。留空则不注入任何提示词。",
-    "default": "图片中可能包含宫格图。宫格图是 GIF 动图的关键帧拆分，这些帧按时间顺序排列，共同描述了一段连续画面。请把它们当作动态 GIF 来理解，禁止提及“宫格”、“拼接”等技术细节。"
   },
   "debug_to_info": {
     "type": "bool",
