@@ -1,7 +1,7 @@
 name: astrbot_plugin_read_gif
 display_name: GIF 与视频理解增强
 desc: 将 GIF 动图与视频抽帧拼成宫格图，帮助模型理解连续画面；支持通过框架音频接口结合视频声音理解内容。
-version: "2.0.0"
+version: "2.0.1"
 author: Singularity
 repo: https://github.com/singularity2000/astrbot_plugin_read_gif
 astrbot_version: ">=4.0.0"

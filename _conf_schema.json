@@ -97,11 +97,5 @@
     "description": "缓存文件最大保留时长（小时）",
     "hint": "超过此时长的缓存文件会在自动清理时被删除",
     "default": 24
-  },
-  "debug_to_info": {
-    "type": "bool",
-    "description": "在 Info 日志中显示 Debug 信息",
-    "hint": "默认关闭。开启后，本插件所有 Debug 级别的诊断日志会升级为 Info 级别输出，便于在不调整全局日志等级的情况下排查问题。",
-    "default": false
   }
 }
