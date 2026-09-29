@@ -17,16 +17,17 @@ class GifProcessor:
     """GIF 动图处理器。"""
 
     # 自动选择宫格的时长阈值（秒）和推荐宫格数
-    # 规则：1秒内4宫格，10秒内9宫格，20秒内16宫格，超过20秒25宫格
+    # 达到 1/10/20/30 秒时分别切换至 9/16/25/36 格。
     AUTO_GRID_RULES = [
         (0.0, 4),
         (1.0, 9),
         (10.0, 16),
         (20.0, 25),
+        (30.0, 36),
     ]
 
     # 默认最大输出尺寸限制（单张宫格图的长边像素）
-    DEFAULT_MAX_OUTPUT_SIZE = 1600
+    DEFAULT_MAX_OUTPUT_SIZE = 1800
 
     @staticmethod
     def is_gif(path: str) -> bool:
@@ -43,6 +44,21 @@ class GifProcessor:
                 return header in (b"GIF87a", b"GIF89a")
         except OSError:
             return False
+
+    @staticmethod
+    def validate_animation_file(path: str) -> bool:
+        """仅用于普通文件入口：检查真实格式及资源上限，不改变原 GIF 路径。"""
+        if os.path.getsize(path) > 64 * 1024 * 1024:
+            raise ValueError("动图附件超过 64 MiB 安全限制")
+        with PILImage.open(path) as image:
+            if image.format not in {"GIF", "PNG", "WEBP"}:
+                raise ValueError("附件内容不是支持的 GIF、WebP 或 APNG 格式")
+            frames = getattr(image, "n_frames", 1)
+            pixels = image.width * image.height
+            if frames > 2000 or pixels > 16_777_216 or pixels * frames > 200_000_000:
+                raise ValueError("动图附件的帧数或像素总量超过安全限制")
+            # APNG 可包含不属于动画的默认封面。
+            return frames - int(bool(image.info.get("default_image", False))) > 1
 
     @staticmethod
     def compute_file_hash(path: str) -> str:
@@ -70,7 +86,7 @@ class GifProcessor:
 
         # 按时长找推荐值
         recommended = 4
-        rules = cls.AUTO_GRID_RULES if thresholds is None else [(0.0, 4), *zip(thresholds, (9, 16, 25))]
+        rules = cls.AUTO_GRID_RULES if thresholds is None else [(0.0, 4), *zip(thresholds, (9, 16, 25, 36))]
         for threshold, grid in rules:
             if duration_s >= threshold:
                 recommended = grid
@@ -97,6 +113,8 @@ class GifProcessor:
             "16宫格": 16,
             "25": 25,
             "25宫格": 25,
+            "36": 36,
+            "36宫格": 36,
             "auto": 0,
             "自动": 0,
         }
@@ -123,9 +141,9 @@ class GifProcessor:
 
         Args:
             gif_path: GIF 文件本地路径
-            grid_preset: 宫格预设（4/9/16/25/auto/自动）
+            grid_preset: 宫格预设（4/9/16/25/36/auto/自动）
             cache_dir: 缓存目录
-            max_output_size: 宫格图长边最大像素，0 表示使用默认值 1600
+            max_output_size: 宫格图长边最大像素，0 表示使用默认值 1800
 
         Returns:
             (output_path, info_dict)
@@ -196,12 +214,15 @@ class GifProcessor:
     ) -> dict:
         """同步：解析 GIF 元数据（帧数、时长、宫格数），计算缓存路径和预期输出尺寸。"""
         with PILImage.open(gif_path) as im:
-            n_frames = getattr(im, "n_frames", 1)
+            frame_start = int(bool(im.info.get("default_image", False)))
+            n_frames = getattr(im, "n_frames", 1) - frame_start
 
             # 获取每帧延迟，计算总时长
             total_duration_ms = 0
             for i in range(n_frames):
-                im.seek(i)
+                im.seek(i + frame_start)
+                if im.format == "WEBP":
+                    im.load()  # Pillow 在加载 WebP 帧后才提供该帧时长。
                 delay = im.info.get("duration", 100)
                 if delay is None or delay <= 0:
                     delay = 100
@@ -214,7 +235,7 @@ class GifProcessor:
             grid_side = int(math.isqrt(grid_size))
 
             # 取第一帧尺寸用于计算预期输出
-            im.seek(0)
+            im.seek(frame_start)
             first_w, first_h = im.size
 
         # 计算预期输出尺寸（含等比缩放）
@@ -234,6 +255,7 @@ class GifProcessor:
 
         return {
             "frame_count": n_frames,
+            "frame_start": frame_start,
             "duration_s": duration_s,
             "grid_size": grid_size,
             "grid_side": grid_side,
@@ -257,7 +279,9 @@ class GifProcessor:
         n_frames = parsed["frame_count"]
 
         # 均匀取帧索引
-        if n_frames <= grid_size:
+        if grid_size == 1:
+            indices = [0]
+        elif n_frames <= grid_size:
             indices = list(range(n_frames))
             # 帧数不足，用最后一帧填充
             while len(indices) < grid_size:
@@ -271,7 +295,7 @@ class GifProcessor:
         frames = []
         with PILImage.open(gif_path) as im:
             for idx in indices:
-                im.seek(idx)
+                im.seek(idx + parsed.get("frame_start", 0))
                 frame = im.copy()
                 # 处理透明背景：合成到白色背景上
                 if frame.mode in ("RGBA", "P"):

@@ -2,20 +2,21 @@
   "grid_preset": {
     "type": "string",
     "description": "宫格预设",
-    "hint": "GIF 与视频共用。自动模式按各自的时长切换点选择 4/9/16/25 格；固定档不使用自动阈值。",
+    "hint": "GIF 与视频共用。自动模式按各自的时长切换点选择 4/9/16/25/36 格；固定档不使用自动阈值。",
     "default": "auto",
     "options": [
       "auto",
       "4",
       "9",
       "16",
-      "25"
+      "25",
+      "36"
     ]
   },
   "gif_auto_thresholds": {
     "type": "object",
     "description": "GIF 自动宫格阈值（秒）",
-    "hint": "仅自动档生效。三个值须为有限正数且严格递增；无效时该组全部回退默认值。达到切换点即升档。",
+    "hint": "仅自动档生效。四个值须为有限正数且严格递增；无效时该组全部回退默认值。达到切换点即升档。",
     "items": {
       "to_9": {
         "type": "float",
@@ -31,13 +32,18 @@
         "type": "float",
         "description": "GIF：切换至 25 格的时长",
         "default": 20
+      },
+      "to_36": {
+        "type": "float",
+        "description": "GIF：切换至 36 格的时长",
+        "default": 30
       }
     }
   },
   "video_auto_thresholds": {
     "type": "object",
     "description": "视频 自动宫格阈值（秒）",
-    "hint": "仅自动档生效。三个值须为有限正数且严格递增；无效时该组全部回退默认值。达到切换点即升档。",
+    "hint": "仅自动档生效。四个值须为有限正数且严格递增；无效时该组全部回退默认值。达到切换点即升档。",
     "items": {
       "to_9": {
         "type": "float",
@@ -53,14 +59,19 @@
         "type": "float",
         "description": "视频：切换至 25 格的时长",
         "default": 30
+      },
+      "to_36": {
+        "type": "float",
+        "description": "视频：切换至 36 格的时长",
+        "default": 45
       }
     }
   },
   "max_output_size": {
     "type": "int",
     "description": "宫格图长边限制（像素）",
-    "hint": "宫格输出图的最大长边分辨率，超出会自动等比缩放。越大越清晰，但消耗更多 token",
-    "default": 1600
+    "hint": "宫格输出图的长边上限，包含视频编号和时间戳。越大通常越清晰，但可能增加模型用量；实际清晰度还受框架和模型限制。",
+    "default": 1800
   },
   "gif_hint_text": {
     "type": "text",
@@ -77,8 +88,8 @@
   "video_max_duration": {
     "type": "string",
     "description": "视频时长上限",
-    "hint": "单位：秒，支持小数。默认 60；留空不限制；0、负数、非有限数或格式错误按 60 秒处理。超限跳过整个视频，不截取前半段。",
-    "default": "60"
+    "hint": "单位：秒，支持小数。默认 90；留空不限制；0、负数、非有限数或格式错误按 90 秒处理。超限跳过整个视频，不截取前半段。",
+    "default": "90"
   },
   "understand_video_audio": {
     "type": "bool",

@@ -28,7 +28,8 @@ class VideoProcessingError(Exception):
 
 
 class VideoProcessor:
-    CACHE_VERSION = 1
+    CACHE_VERSION = 3
+    AUDIO_CACHE_VERSION = 1  # 音频格式未变，继续复用原有音轨缓存。
     TIMEOUT = 120
     MAX_SOURCE_BYTES = 512 * 1024 * 1024
     MAX_AUDIO_BYTES = 32 * 1024 * 1024
@@ -100,9 +101,9 @@ class VideoProcessor:
 
     async def process_video(
         self, source: str, grid_preset: str, cache_dir: str,
-        max_output_size: int = 1600,
-        thresholds: tuple[float, float, float] = VIDEO_THRESHOLDS,
-        duration_limit: float | None = 60.0, include_audio: bool = True,
+        max_output_size: int = 1800,
+        thresholds: tuple[float, float, float, float] = VIDEO_THRESHOLDS,
+        duration_limit: float | None = 90.0, include_audio: bool = True,
     ) -> tuple[str, dict]:
         cancel = threading.Event()
         self._pending_jobs += 1
@@ -165,8 +166,8 @@ class VideoProcessor:
             grid = GifProcessor.parse_grid_preset(preset, duration, frame_count, thresholds)
             # 视频固定档也不重复填帧；少于目标帧数时缩小为完全平方数。
             grid = min(grid, max(1, math.isqrt(frame_count) ** 2))
-            max_size = int(max_size or 1600)
-            max_size = min(4096, max(128, max_size if max_size > 0 else 1600))
+            max_size = int(max_size or 1800)
+            max_size = min(4096, max(128, max_size if max_size > 0 else 1800))
             cache = Path(cache_dir)
             cache.mkdir(parents=True, exist_ok=True)
             digest = hashlib.sha256()
@@ -221,10 +222,13 @@ class VideoProcessor:
 
     def _render(self, ffmpeg, source, video, duration, grid, size, media_id, output, deadline):
         side = math.isqrt(grid)
-        cell = max(1, (size - 32) // side)
-        font_size = max(10, min(24, cell // 12))
-        label_height = min(cell - 1, font_size + 8)
-        image_height = cell - label_height
+        # 为整图标题和每行时间戳预留高度；画面不再填充为正方形。
+        column_gap = 3 if side > 1 else 0
+        max_width = max(1, (size - column_gap * (side - 1)) // side)
+        cell_height = max(1, (size - 32) // side)
+        font_size = max(10, min(24, max_width // 12))
+        label_height = min(cell_height - 1, font_size + 8)
+        max_height = cell_height - label_height
         # 覆盖首帧至末尾附近，不请求恰好 EOF；以帧时间戳采样而非帧序号。
         try:
             numerator, denominator = video.get("avg_frame_rate", "0/1").split("/")
@@ -235,10 +239,10 @@ class VideoProcessor:
         targets = [end * i / (grid - 1) for i in range(grid)] if grid > 1 else [0.0]
         select = "+".join(f"gte(t,{t:.9f})*eq(selected_n,{i})" for i, t in enumerate(targets))
         filters = (
-            f"setpts=PTS-STARTPTS,select='{select}',showinfo,"
-            f"scale=w='max(1,if(gte(dar,{cell/image_height}),{cell},trunc({image_height}*dar)))':"
-            f"h='max(1,if(gte(dar,{cell/image_height}),trunc({cell}/dar),{image_height}))',"
-            f"setsar=1,pad={cell}:{image_height}:(ow-iw)/2:(oh-ih)/2:color=black"
+            f"setpts=PTS-STARTPTS,select='{select}',"
+            f"scale=w='max(1,if(gte(dar,{max_width/max_height}),{max_width},trunc({max_height}*dar)))':"
+            f"h='max(1,if(gte(dar,{max_width/max_height}),trunc({max_width}/dar),{max_height}))',"
+            f"setsar=1,showinfo"
         )
         result = self._run([
             ffmpeg, "-hide_banner", "-nostdin", "-loglevel", "info", "-threads", "2",
@@ -246,26 +250,40 @@ class VideoProcessor:
             "-an", "-sn", "-dn", "-vf", filters, "-frames:v", str(grid),
             "-vsync", "0", "-threads", "1", "-f", "rawvideo", "-pix_fmt", "rgb24", "pipe:1",
         ], deadline)
-        times = [float(t) for t in re.findall(
-            r"\bn:\s*\d+\s+pts:\s*\S+\s+pts_time:\s*([-+\d.eE]+)",
+        # 读取缩放后的实际尺寸，直接沿用 FFmpeg 对旋转和像素宽高比的处理。
+        samples = re.findall(
+            r"\bn:\s*\d+\s+pts:\s*\S+\s+pts_time:\s*([-+\d.eE]+)[^\r\n]*?\bs:(\d+)x(\d+)",
             result.stderr.decode("utf-8", errors="replace"),
-        )]
-        frame_bytes = cell * image_height * 3
+        )
+        if not samples:
+            raise VideoProcessingError("未能抽取视频画面")
+        times = [float(sample[0]) for sample in samples]
+        image_width, image_height = int(samples[0][1]), int(samples[0][2])
+        if (not 0 < image_width <= max_width or not 0 < image_height <= max_height
+                or any((int(w), int(h)) != (image_width, image_height) for _, w, h in samples)):
+            raise VideoProcessingError("视频采样画面尺寸不一致或超出限制")
+        frame_bytes = image_width * image_height * 3
         count = min(len(times), len(result.stdout) // frame_bytes, grid)
         if not count:
             raise VideoProcessingError("未能抽取视频画面")
         actual = math.isqrt(count) ** 2
         chosen = [round(i * (count - 1) / (actual - 1)) for i in range(actual)] if actual > 1 else [0]
         side = math.isqrt(actual)
-        canvas = Image.new("RGB", (side * cell, side * cell + 32), "black")
+        cell_height = image_height + label_height
+        canvas_width = side * image_width + column_gap * (side - 1)
+        canvas = Image.new("RGB", (canvas_width, side * cell_height + 32), "black")
         draw = ImageDraw.Draw(canvas)
         draw.text((6, 5), f"{media_id} | {duration:.3f}s", fill="white", font=ImageFont.load_default(size=18))
         font = ImageFont.load_default(size=font_size)
         for position, i in enumerate(chosen):
-            frame = Image.frombytes("RGB", (cell, image_height), result.stdout[i*frame_bytes:(i+1)*frame_bytes])
-            x, y = (position % side) * cell, 32 + (position // side) * cell
+            frame = Image.frombytes("RGB", (image_width, image_height), result.stdout[i*frame_bytes:(i+1)*frame_bytes])
+            x, y = (position % side) * (image_width + column_gap), 32 + (position // side) * cell_height
             canvas.paste(frame, (x, y + label_height))
             draw.text((x + 3, y + 2), f"{times[i]:.3f}s", fill="white", font=font)
+        # 保持列间隔纯黑，避免极窄格子的时间戳溢出到间隔内。
+        for column in range(1, side):
+            x = column * (image_width + column_gap) - column_gap
+            draw.rectangle((x, 32, x + column_gap - 1, canvas.height - 1), fill="black")
         temp = output.with_name(output.name + "." + uuid.uuid4().hex + ".tmp")
         try:
             canvas.save(temp, "PNG", optimize=True)
@@ -275,7 +293,7 @@ class VideoProcessor:
         return [times[i] for i in chosen], actual
 
     def _audio(self, ffmpeg, source, video, audio, duration, cache, digest, deadline):
-        stem = f"video_audio_{digest}_v{self.CACHE_VERSION}"
+        stem = f"video_audio_{digest}_v{self.AUDIO_CACHE_VERSION}"
         output, silent = cache / (stem + ".wav"), cache / (stem + ".silent")
         if silent.is_file():
             silent.touch()
