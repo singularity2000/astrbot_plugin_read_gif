@@ -4,6 +4,7 @@
 只持久化宫格、音轨和小型缓存索引，写入使用原子替换。
 """
 import asyncio
+from fractions import Fraction
 import hashlib
 import json
 import math
@@ -28,7 +29,7 @@ class VideoProcessingError(Exception):
 
 
 class VideoProcessor:
-    CACHE_VERSION = 3
+    CACHE_VERSION = 4
     AUDIO_CACHE_VERSION = 1  # 音频格式未变，继续复用原有音轨缓存。
     TIMEOUT = 120
     MAX_SOURCE_BYTES = 512 * 1024 * 1024
@@ -134,7 +135,7 @@ class VideoProcessor:
             probe = self._run([
                 ffprobe, "-v", "error", "-protocol_whitelist", "file,pipe", "-format_whitelist", self.FORMATS,
                 "-show_entries",
-                "format=duration,start_time:stream=index,codec_type,width,height,duration,start_time,nb_frames,avg_frame_rate:stream_disposition=attached_pic:stream_tags=DURATION",
+                "format=duration,start_time:stream=index,codec_type,width,height,duration,duration_ts,time_base,start_time,nb_frames,avg_frame_rate:stream_disposition=attached_pic:stream_tags=DURATION",
                 "-of", "json", source,
             ], deadline)
             try:
@@ -229,15 +230,28 @@ class VideoProcessor:
         font_size = max(10, min(24, max_width // 12))
         label_height = min(cell_height - 1, font_size + 8)
         max_height = cell_height - label_height
-        # 覆盖首帧至末尾附近，不请求恰好 EOF；以帧时间戳采样而非帧序号。
+        # 优先用原始时间刻度恢复精确时长，避免 ffprobe 的小数秒舍入漏掉末帧。
+        sample_duration = Fraction(str(duration))
         try:
-            numerator, denominator = video.get("avg_frame_rate", "0/1").split("/")
-            fps = float(numerator) / float(denominator)
-        except (ValueError, ZeroDivisionError):
+            time_base = Fraction(video["time_base"])
+            duration_ts = int(video["duration_ts"])
+            if time_base > 0 and duration_ts > 0:
+                sample_duration = duration_ts * time_base
+        except (KeyError, TypeError, ValueError, ZeroDivisionError):
+            pass  # 没有精确时长的容器沿用已有的时长来源。
+        try:
+            fps = Fraction(video.get("avg_frame_rate", "0/1"))
+        except (TypeError, ValueError, ZeroDivisionError):
             fps = 0
-        end = max(0.0, duration - (1 / fps if fps > 0 else min(0.1, duration / 100)))
-        targets = [end * i / (grid - 1) for i in range(grid)] if grid > 1 else [0.0]
-        select = "+".join(f"gte(t,{t:.9f})*eq(selected_n,{i})" for i, t in enumerate(targets))
+        frame_step = 1 / fps if fps > 0 else min(Fraction(1, 10), sample_duration / 100)
+        end = max(Fraction(0), sample_duration - frame_step)
+        targets = [end * i / (grid - 1) for i in range(grid)] if grid > 1 else [Fraction(0)]
+        # 使用滤镜实际的 TB 对齐整数 PTS，不假定它始终等于流的 time_base。
+        # 仍按时间均匀采样、只解码一遍；不重复填帧，也不增加全帧扫描。
+        select = "+".join(
+            f"gte(pts,round({t.numerator}/{t.denominator}/TB))*eq(selected_n,{i})"
+            for i, t in enumerate(targets)
+        )
         filters = (
             f"setpts=PTS-STARTPTS,select='{select}',"
             f"scale=w='max(1,if(gte(dar,{max_width/max_height}),{max_width},trunc({max_height}*dar)))':"

@@ -29,7 +29,7 @@ from .media_config import GIF_THRESHOLDS, VIDEO_THRESHOLDS, parse_thresholds, pa
 from .video_processor import VideoProcessor, VideoProcessingError
 
 
-@register("astrbot_plugin_read_gif", "Singularity", "GIF 与视频理解增强", "2.1.0")
+@register("astrbot_plugin_read_gif", "Singularity", "GIF 与视频理解增强", "2.1.1")
 class ReadGifPlugin(Star):
     """在内置 Agent 请求前转换 GIF、增强视频，复用框架图片转述及音频输入。
 
