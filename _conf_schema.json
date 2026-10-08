@@ -91,22 +91,41 @@
     "hint": "单位：秒，支持小数。默认 90；留空不限制；0、负数、非有限数或格式错误按 90 秒处理。超限跳过整个视频，不截取前半段。",
     "default": "90"
   },
+  "media_download_timeout_seconds": {
+    "type": "string",
+    "description": "视频与媒体附件获取超时（秒）",
+    "hint": "控制插件等待视频组件或媒体文件附件（含动图）获取本地文件的时长。正数，支持小数；默认及留空均为 60 秒，无效值也回退 60 秒。不影响普通图片入口、框架/平台自身超时或视频解码时限。",
+    "default": "60"
+  },
   "understand_video_audio": {
     "type": "bool",
     "description": "理解视频中的音频",
     "hint": "开启时，提取有声视频的音轨，通过框架音频接口交给支持音频输入的主模型。不额外调用语音转文字服务；无音轨或完全静音时不发送音频。声音输入可能增加模型费用。",
     "default": true
   },
-  "auto_cleanup_interval_min": {
-    "type": "int",
-    "description": "自动清理缓存间隔（分钟）",
-    "hint": "0 表示关闭自动清理",
-    "default": 60
-  },
-  "cache_max_age_hours": {
-    "type": "int",
-    "description": "缓存文件最大保留时长（小时）",
-    "hint": "超过此时长的缓存文件会在自动清理时被删除",
-    "default": 24
+  "cache_management": {
+    "type": "object",
+    "description": "缓存管理",
+    "hint": "启动、缓存生成完成和请求结束时检查；按最近到期时间自动唤醒，不固定轮询。任一上限超出时优先清理旧文件，在用文件暂缓。三项全空关闭自动清理；保存并重载插件后生效。",
+    "items": {
+      "max_age_hours": {
+        "type": "string",
+        "description": "缓存文件最大保留时长（小时）",
+        "hint": "正数，支持小数；留空不限制。按文件最后修改时间计算。0、负数、非有限数或格式错误会暂停全部自动清理。",
+        "default": ""
+      },
+      "max_size_mb": {
+        "type": "string",
+        "description": "缓存总大小上限（MB）",
+        "hint": "正数，支持小数；留空不限制。1 MB = 1024 × 1024 字节。0、负数、非有限数或格式错误会暂停全部自动清理。",
+        "default": ""
+      },
+      "max_files": {
+        "type": "string",
+        "description": "缓存文件数量上限（个）",
+        "hint": "正整数；留空不限制。宫格、音轨、索引及静音标记等分别计数，不是媒体条数。0、负数或格式错误会暂停全部自动清理。",
+        "default": ""
+      }
+    }
   }
 }

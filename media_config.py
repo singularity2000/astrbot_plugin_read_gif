@@ -37,3 +37,16 @@ def parse_video_limit(value="90"):
     except (TypeError, ValueError, OverflowError):
         pass
     return 90.0
+
+
+def parse_download_timeout(value="60") -> float:
+    """文件获取超时：默认、留空、无效值均使用 60 秒，不支持无限等待。"""
+    try:
+        if isinstance(value, bool):
+            raise ValueError
+        number = float(value)
+        if math.isfinite(number) and number > 0:
+            return number
+    except (TypeError, ValueError, OverflowError):
+        pass
+    return 60.0

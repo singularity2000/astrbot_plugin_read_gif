@@ -24,12 +24,16 @@ from astrbot.core.star.register.star_handler import (
 )
 from astrbot.core.utils.astrbot_path import get_astrbot_data_path
 
+from .cache_manager import CacheManager, format_size
 from .gif_processor import GifProcessor
-from .media_config import GIF_THRESHOLDS, VIDEO_THRESHOLDS, parse_thresholds, parse_video_limit
+from .media_config import (
+    GIF_THRESHOLDS, VIDEO_THRESHOLDS, parse_download_timeout,
+    parse_thresholds, parse_video_limit,
+)
 from .video_processor import VideoProcessor, VideoProcessingError
 
 
-@register("astrbot_plugin_read_gif", "Singularity", "GIF 与视频理解增强", "2.1.1")
+@register("astrbot_plugin_read_gif", "Singularity", "GIF 与视频理解增强", "2.2.0")
 class ReadGifPlugin(Star):
     """在内置 Agent 请求前转换 GIF、增强视频，复用框架图片转述及音频输入。
 
@@ -52,14 +56,22 @@ class ReadGifPlugin(Star):
         self.config = config
         self.processor = GifProcessor()
         self._ensure_cache_dir()
-        self._last_cleanup = time.time()
         self.video_processor = VideoProcessor()
         self._caption_scope = ContextVar(f"read_gif_caption_{id(self)}", default=None)
         self._caption_wrappers = {}
         self._cache_users = weakref.WeakKeyDictionary()
+        self._gif_jobs = set()
         self._warned_config = set()
+        self.cache = CacheManager(
+            self._get_cache_dir(), self._get_config("cache_management", {}),
+            logger, self._cache_protection,
+        )
         # 中和框架 PreProcessStage 对 GIF 的 JPEG 转换（仅 v4.26+ 需要，旧版本自动跳过）
         self._install_ensure_jpeg_guard()
+
+    async def initialize(self) -> None:
+        """框架生命周期启动检查，不在构造函数里创建调度任务。"""
+        self.cache.start()
 
     def _install_ensure_jpeg_guard(self) -> None:
         """中和框架 PreProcessStage 对 GIF 的 JPEG 转换。
@@ -154,14 +166,6 @@ class ReadGifPlugin(Star):
         if hasattr(self.config, "get"):
             return self.config.get(key, default)
         return default
-
-    def _should_cleanup(self) -> bool:
-        """判断是否应该执行自动缓存清理。"""
-        interval_min = self._get_config("auto_cleanup_interval_min", 60)
-        if interval_min <= 0:
-            return False
-        elapsed = time.time() - self._last_cleanup
-        return elapsed >= interval_min * 60
 
     def _get_provider_settings(self, event: AstrMessageEvent) -> dict:
         """获取当前会话的 provider_settings dict。
@@ -271,10 +275,54 @@ class ReadGifPlugin(Star):
                     del provider.text_chat
         self._caption_wrappers.clear()
 
-    def _pin_video_cache(self, paths):
+    def _pin_cache(self, paths):
         task = asyncio.current_task()
         if task is not None:
-            self._cache_users.setdefault(task, set()).update(str(path) for path in paths if path)
+            if task not in self._cache_users:
+                self._cache_users[task] = set()
+                task.add_done_callback(self._release_cache)
+            self._cache_users[task].update(str(path) for path in paths if path)
+
+    def _release_cache(self, task):
+        self._cache_users.pop(task, None)
+        self.cache.request_check("请求结束")
+
+    def _cache_protection(self):
+        protected = set()
+        for task, paths in list(self._cache_users.items()):
+            if not task.done():
+                protected.update(paths)
+        busy = []
+        if self.video_processor.busy:
+            busy.append("video_")
+        if self._gif_jobs:
+            busy.append("gif_grid_")
+        return protected, busy
+
+    async def _process_gif(self, *args, **kwargs):
+        """在生成与模型读取期间保护动图缓存，包括请求取消后仍未完成的线程。"""
+        job = asyncio.create_task(self.processor.process_gif(*args, **kwargs))
+        self._gif_jobs.add(job)
+        try:
+            path, info = await asyncio.shield(job)
+            self._pin_cache([path])
+            return path, info
+        finally:
+            if job.done():
+                self._gif_jobs.discard(job)
+                self.cache.request_check("动图处理结束")
+            else:
+                # to_thread 无法中断正在写入的线程；保留保护直到它真正结束。
+                job.add_done_callback(self._finish_gif_job)
+
+    def _finish_gif_job(self, job):
+        self._gif_jobs.discard(job)
+        self.cache.request_check("动图处理结束")
+        if not job.cancelled():
+            job.exception()  # 取回已取消请求的后台异常，避免未处理任务警告。
+
+    def _get_download_timeout(self) -> float:
+        return parse_download_timeout(self._get_config("media_download_timeout_seconds", "60"))
 
     @staticmethod
     def _video_facts(info, status=None):
@@ -295,6 +343,7 @@ class ReadGifPlugin(Star):
     @staticmethod
     def _record_video_fetch_failure(
         event: AstrMessageEvent, exc: Exception, *, attachment: bool = False,
+        timeout_seconds: float = 60.0,
     ) -> None:
         """仅记录当前获取操作的异常链，不截取可能混入其它会话的全局日志。"""
         reasons, seen = [], set()
@@ -303,7 +352,8 @@ class ReadGifPlugin(Star):
             seen.add(id(current))
             detail = str(current).strip()
             if not detail and isinstance(current, asyncio.TimeoutError):
-                detail = "获取媒体附件超时（等待上限 60 秒）" if attachment else "获取视频文件超时（等待上限 60 秒）"
+                target = "媒体附件" if attachment else "视频文件"
+                detail = f"获取{target}超时（插件等待上限 {timeout_seconds:g} 秒；也可能由框架或平台提前超时）"
             reasons.append(f"{type(current).__name__}: {detail}" if detail else type(current).__name__)
             current = current.__cause__ or (
                 None if current.__suppress_context__ else current.__context__
@@ -323,6 +373,7 @@ class ReadGifPlugin(Star):
     async def _handle_video(self, comp, event, *, attachment=False):
         """保留原视频组件与附件信息；成功追加画面，失败仅回填已取得的路径。"""
         fetch_failure_recorded = False
+        timeout_seconds = self._get_download_timeout()
         try:
             self.video_processor.tools()  # 缺少工具时不先下载大视频。
             try:
@@ -339,26 +390,32 @@ class ReadGifPlugin(Star):
                         source = str(Path(value).resolve())
                         break
                 if source is None:
-                    source = await asyncio.wait_for(comp.convert_to_file_path(), timeout=60)
+                    source = await asyncio.wait_for(
+                        comp.convert_to_file_path(), timeout=timeout_seconds,
+                    )
                 # 在当前运行环境内解析，Docker 使用容器路径，不拼接宿主机路径。
                 source = str(Path(source).resolve())
                 if not Path(source).is_file():
                     raise VideoProcessingError("视频本地文件不可用")
             except Exception as exc:
-                self._record_video_fetch_failure(event, exc, attachment=attachment)
+                self._record_video_fetch_failure(
+                    event, exc, attachment=attachment, timeout_seconds=timeout_seconds,
+                )
                 fetch_failure_recorded = True
                 raise
             local = Video.fromFileSystem(source)
             # 同一 Video 仍交给框架；file 优先指向现有文件，避免再次下载。
             # 保留 url/cover 等原始元数据，失败时仍可供其它处理器使用。
             comp.file, comp.path = local.file, source
+            self._pin_cache([])
             path, info = await self.video_processor.process_video(
                 source, self._get_config("grid_preset", "auto"), self._get_cache_dir(),
                 self._get_config("max_output_size", 1800), self._get_thresholds("video"),
                 parse_video_limit(self._get_config("video_max_duration", "90")),
                 bool(self._get_config("understand_video_audio", True)),
             )
-            self._pin_video_cache([path, info.get("audio_path"), str(Path(path).with_suffix(".json"))])
+            self._pin_cache([path, info.get("audio_path"), str(Path(path).with_suffix(".json"))])
+            self.cache.request_check("视频处理结束")
             if info.get("audio_error"):
                 logger.warning(f"[astrbot_plugin_read_gif] {info['audio_error']}")
             logger.info(f"[astrbot_plugin_read_gif] 视频 {info['duration_s']:.3f}s，转为 {info['grid_size']} 宫格，音频状态 {info['audio_status']}")
@@ -396,10 +453,11 @@ class ReadGifPlugin(Star):
         animation = suffix in self._ANIMATION_SUFFIXES
         if not animation and suffix not in self._VIDEO_SUFFIXES:
             return [comp], None, None
+        timeout_seconds = self._get_download_timeout()
         try:
             if not animation:
                 self.video_processor.tools()  # 缺少工具不为增强主动下载。
-            source = await asyncio.wait_for(comp.get_file(), timeout=60)
+            source = await asyncio.wait_for(comp.get_file(), timeout=timeout_seconds)
             if not source or not Path(source).is_file():
                 raise ValueError("媒体附件本地文件不可用")
             source = str(Path(source).resolve())
@@ -407,7 +465,7 @@ class ReadGifPlugin(Star):
             if animation:
                 if not await asyncio.to_thread(self.processor.validate_animation_file, source):
                     return [comp], None, None  # 静态 PNG/WebP/GIF 保持原样。
-                path, info = await self.processor.process_gif(
+                path, info = await self._process_gif(
                     source, self._get_config("grid_preset", "auto"), self._get_cache_dir(),
                     self._get_config("max_output_size", 1800), self._get_thresholds("gif"),
                 )
@@ -420,7 +478,9 @@ class ReadGifPlugin(Star):
             # 临时 Video 仅复用处理逻辑；消息链始终保留原 File，避免重复附件。
             return [comp, *replacement[1:]], None, info
         except Exception as exc:
-            self._record_video_fetch_failure(event, exc, attachment=True)
+            self._record_video_fetch_failure(
+                event, exc, attachment=True, timeout_seconds=timeout_seconds,
+            )
             return [comp], None, None
 
     def _attach_video_audio(self, event, req):
@@ -454,45 +514,6 @@ class ReadGifPlugin(Star):
         base = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n*", "", req.prompt or "", flags=re.S)
         req.prompt = f"{base}\n{start}\n" + "\n".join(facts) + f"\n{end}"
 
-    async def _do_cleanup(self, all_files: bool = False) -> int:
-        """执行缓存清理，返回删除的文件数。
-
-        - all_files=False（默认，自动清理用）：只删除超过 cache_max_age_hours 的过期文件
-        - all_files=True（手动命令用）：清空全部缓存文件，无论新旧
-        """
-        cache_dir = self._get_cache_dir()
-        if not os.path.isdir(cache_dir):
-            return 0
-        cutoff = time.time() - self._get_config("cache_max_age_hours", 24) * 3600
-        protected = set()
-        for task, paths in list(self._cache_users.items()):
-            if not task.done():
-                protected.update(paths)
-        removed = 0
-        for entry in os.listdir(cache_dir):
-            path = os.path.join(cache_dir, entry)
-            if not os.path.isfile(path):
-                continue
-            if entry.startswith("video_") and (
-                path in protected or entry.endswith(".tmp") or self.video_processor.busy
-            ):
-                continue
-            if all_files or os.path.getmtime(path) < cutoff:
-                try:
-                    os.remove(path)
-                    removed += 1
-                except OSError:
-                    pass
-        self._last_cleanup = time.time()
-        return removed
-
-    async def _maybe_cleanup(self) -> None:
-        """按需触发自动缓存清理。"""
-        if self._should_cleanup():
-            removed = await self._do_cleanup()
-            if removed > 0:
-                logger.info(f"[astrbot_plugin_read_gif] 自动清理缓存完成，删除 {removed} 个文件")
-
     @register_on_waiting_llm_request()
     async def on_waiting_llm_request(self, event: AstrMessageEvent) -> None:
         """在构建内置 Agent 前替换媒体；视频与 GIF 单独失败、单独计数。"""
@@ -501,7 +522,6 @@ class ReadGifPlugin(Star):
             if event.get_extra("gif_caption_path", False):
                 self._install_caption_wrapper(event)
             return
-        await self._maybe_cleanup()
         videos, gif_infos = [], []
         async def _handle_image(comp: Image):
             """替换单个 Image，返回 (新组件或None, info或None)。"""
@@ -513,7 +533,7 @@ class ReadGifPlugin(Star):
             if not self.processor.is_gif(image_path):
                 return None, None
             try:
-                grid_path, info = await self.processor.process_gif(
+                grid_path, info = await self._process_gif(
                     image_path,
                     grid_preset=self._get_config("grid_preset", "auto"),
                     thresholds=self._get_thresholds("gif"),
@@ -714,6 +734,7 @@ class ReadGifPlugin(Star):
                     break
 
         if target and os.path.exists(target):
+            self._pin_cache([target])
             # chain_result 期望 list[BaseMessageComponent]，不是 MessageChain 对象
             yield event.chain_result([
                 Plain(f"缓存图：{os.path.basename(target)}"),
@@ -724,11 +745,19 @@ class ReadGifPlugin(Star):
 
     @register_command("gifclean")
     async def gif_clean_cmd(self, event: AstrMessageEvent) -> None:
-        """手动清空缓存目录中的所有宫格图。"""
-        removed = await self._do_cleanup(all_files=True)
-        yield event.plain_result(f"已清理 {removed} 个缓存文件。")
+        """清理插件生成的缓存，跳过正在生成或使用的文件。"""
+        result = self.cache.check("手动命令", all_files=True)
+        suffix = "；部分文件暂未清理，请稍后重试。" if result.deferred else "。"
+        yield event.plain_result(
+            f"已清理 {result.removed} 个缓存文件，共 {format_size(result.removed_bytes)}；"
+            f"跳过 {result.skipped} 个在用文件{suffix}"
+        )
 
     async def terminate(self) -> None:
         """恢复本插件安装的包装，不碰其它插件后来安装的覆盖。"""
+        self.cache.close()
+        for task in list(self._cache_users):
+            task.remove_done_callback(self._release_cache)
+        self._cache_users.clear()
         self._uninstall_caption_wrapper()
         self._uninstall_ensure_jpeg_guard()
