@@ -17,6 +17,7 @@ from astrbot.api.star import Context, Star, register
 from astrbot.api.event import AstrMessageEvent
 from astrbot.api.message_components import File, Image, Plain, Reply, Video
 from astrbot.api.provider import ProviderRequest
+from astrbot.core.agent.message import TextPart
 from astrbot.core.star.register.star_handler import (
     register_on_waiting_llm_request,
     register_on_llm_request,
@@ -30,10 +31,10 @@ from .media_config import (
     GIF_THRESHOLDS, VIDEO_THRESHOLDS, parse_download_timeout,
     parse_thresholds, parse_video_limit,
 )
-from .video_processor import VideoProcessor, VideoProcessingError
+from .video_processor import VideoDurationExceeded, VideoProcessor, VideoProcessingError
 
 
-@register("astrbot_plugin_read_gif", "Singularity", "GIF 与视频理解增强", "2.2.0")
+@register("astrbot_plugin_read_gif", "Singularity", "GIF 与视频理解增强", "2.2.1")
 class ReadGifPlugin(Star):
     """在内置 Agent 请求前转换 GIF、增强视频，复用框架图片转述及音频输入。
 
@@ -41,7 +42,7 @@ class ReadGifPlugin(Star):
     转述提示使用任务局部 ContextVar：共享 Provider 的其它会话不读取本轮提示。
     """
 
-    # 提示词标记对：用于在 system_prompt 中精准定位并清理旧提示词
+    # 提示词标记对：用于识别本轮临时提示，避免重复追加。
     _GIF_HINT_START = "[GIF_HINT_START]"
     _GIF_HINT_END = "[GIF_HINT_END]"
 
@@ -424,6 +425,13 @@ class ReadGifPlugin(Star):
             return [comp, Plain(self._video_facts(info)), Image.fromFileSystem(path)], info
         except asyncio.TimeoutError:
             reason = "获取视频文件超时，未分析该视频"
+        except VideoDurationExceeded as exc:
+            notice = f"此视频时长超过{exc.limit:g}秒，无法快捷浏览。可告知用户，也可继续处理。"
+            notices = list(event.get_extra("read_gif_video_duration_notices", []))
+            notices.append(notice)
+            event.set_extra("read_gif_video_duration_notices", notices)
+            logger.warning(f"[astrbot_plugin_read_gif] {exc}")
+            return [comp], None
         except VideoProcessingError as exc:
             reason = str(exc)
         except Exception as exc:
@@ -433,7 +441,7 @@ class ReadGifPlugin(Star):
         logger.warning(f"[astrbot_plugin_read_gif] {reason}")
         if attachment and not fetch_failure_recorded:
             self._record_video_fetch_failure(event, VideoProcessingError(reason), attachment=True)
-        # 原 Video 仅报告获取失败；新增 File 入口也报告处理失败，不拦截原生处理。
+        # 其它失败沿用原有行为：Video 报告获取失败，File 也报告处理失败。
         # 已成功获取的本地文件留在原组件上复用，不制造第二次下载。
         return [comp], None
 
@@ -612,12 +620,18 @@ class ReadGifPlugin(Star):
                       + "\n".join(file_failures) + "\n[MEDIA_FILE_ERRORS_END]")
             if notice not in (req.prompt or ""):
                 req.prompt = f"{req.prompt or ''}\n{notice}"
+        duration_notices = event.get_extra("read_gif_video_duration_notices", [])
+        if duration_notices:
+            notice = "\n".join(duration_notices)
+            if not any(isinstance(part, TextPart) and part.text == notice for part in req.extra_user_content_parts):
+                req.extra_user_content_parts.append(TextPart(text=notice).mark_as_temp())
         if event.get_extra("read_gif_videos", []) and not event.get_extra("gif_caption_path", False):
             hint = self._get_config("video_hint_text", "")
             start, end = "[VIDEO_HINT_START]", "[VIDEO_HINT_END]"
-            req.system_prompt = re.sub(re.escape(start) + r".*?" + re.escape(end) + r"\n*", "", req.system_prompt or "", flags=re.S)
             if hint:
-                req.system_prompt += f"\n{start}\n{hint}\n{end}\n"
+                text = f"\n{start}\n{hint}\n{end}\n"
+                if not any(isinstance(part, TextPart) and part.text == text for part in req.extra_user_content_parts):
+                    req.extra_user_content_parts.append(TextPart(text=text).mark_as_temp())
 
         third_party_gif_count = self._count_base64_gif_in_urls(req.image_urls)
         if third_party_gif_count > 0:
@@ -635,30 +649,17 @@ class ReadGifPlugin(Star):
         caption_path = event.get_extra("gif_caption_path", False)
         if caption_path:
             # 转述路径：提示词已在 build_main_agent 内由任务隔离包装追加到转述 prompt，
-            # 跳过 system_prompt 注入，避免双重提示
-            logger.debug("[astrbot_plugin_read_gif] 转述路径，跳过 system_prompt 注入")
+            # 不再向主模型追加理解提示，避免双重提示。
+            logger.debug("[astrbot_plugin_read_gif] 转述路径，跳过主模型理解提示")
             return
 
-        # 主 LLM 直看图路径：注入提示词到 system_prompt
+        # 主 LLM 直看图路径：仅向本轮消息追加临时提示，不改写系统提示词。
         hint_text = self._get_config("gif_hint_text", "")
         if hint_text:
-            # 防御性清理：移除可能存在的旧提示词标记段
-            # （system_prompt 每轮由 build_main_agent 重建，正常情况无残留；
-            #   此清理防止同轮多次触发或框架行为变化的边缘情况）
-            pattern = re.compile(
-                re.escape(self._GIF_HINT_START)
-                + r".*?"
-                + re.escape(self._GIF_HINT_END)
-                + r"\n*",
-                re.DOTALL,
-            )
-            req.system_prompt = pattern.sub("", req.system_prompt or "")
-            # 追加新提示词，用标记对包裹
-            req.system_prompt = (
-                f"{req.system_prompt or ''}\n"
-                f"{self._GIF_HINT_START}\n{hint_text}\n{self._GIF_HINT_END}\n"
-            )
-            logger.debug("[astrbot_plugin_read_gif] 已注入 GIF 提示词到 system_prompt")
+            text = f"\n{self._GIF_HINT_START}\n{hint_text}\n{self._GIF_HINT_END}\n"
+            if not any(isinstance(part, TextPart) and part.text == text for part in req.extra_user_content_parts):
+                req.extra_user_content_parts.append(TextPart(text=text).mark_as_temp())
+            logger.debug("[astrbot_plugin_read_gif] 已向本轮消息追加 GIF 临时提示")
 
     @staticmethod
     def _count_base64_gif_in_urls(urls) -> int:

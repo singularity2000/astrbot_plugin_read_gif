@@ -28,6 +28,14 @@ class VideoProcessingError(Exception):
     """可向用户解释、不会阻止 GIF 处理的视频错误。"""
 
 
+class VideoDurationExceeded(VideoProcessingError):
+    """视频超过配置的时长上限，保留上限值供调用方生成提示。"""
+
+    def __init__(self, duration: float, limit: float) -> None:
+        super().__init__(f"视频时长 {duration:.3f} 秒，超过 {limit:g} 秒上限，未分析该视频")
+        self.limit = limit
+
+
 class VideoProcessor:
     CACHE_VERSION = 4
     AUDIO_CACHE_VERSION = 1  # 音频格式未变，继续复用原有音轨缓存。
@@ -159,7 +167,7 @@ class VideoProcessor:
             if duration <= 0:
                 raise VideoProcessingError("无法确定视频时长，已跳过")
             if limit is not None and duration > limit:
-                raise VideoProcessingError(f"视频时长 {duration:.3f} 秒，超过 {limit:g} 秒上限，未分析该视频")
+                raise VideoDurationExceeded(duration, limit)
             width, height = int(video.get("width", 0)), int(video.get("height", 0))
             if width <= 0 or height <= 0 or width * height > 3840 * 2160 * 2:
                 raise VideoProcessingError("视频分辨率无效或超过安全解码范围")
